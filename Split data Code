@@ -1,0 +1,20 @@
+# Assume you already have claims_enriched and policies_clean data.frames
+set.seed(67)
+
+# 1️⃣ Create a vector of unique policy IDs
+policy_ids <- unique(policies_clean$policy_id)
+
+# 2️⃣ Randomly sample 70% of policy IDs for training
+train_ids <- sample(policy_ids, size = 0.7 * length(policy_ids))
+
+# 3️⃣ Split the policy dataset
+policies_train <- policies_clean[policies_clean$policy_id %in% train_ids, ]
+policies_test  <- policies_clean[!policies_clean$policy_id %in% train_ids, ]
+
+# 4️⃣ Split the claims dataset based on the same IDs
+claims_train <- claims_enriched[claims_enriched$policy_id %in% train_ids, ]
+claims_test  <- claims_enriched[!claims_enriched$policy_id %in% train_ids, ]
+
+# 5️⃣ (Optional) Check proportions
+cat("Policies:", nrow(policies_train), "train /", nrow(policies_test), "test\n")
+cat("Claims:", nrow(claims_train), "train /", nrow(claims_test), "test\n")
