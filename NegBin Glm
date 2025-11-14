@@ -1,0 +1,89 @@
+#policies_train and claims_train
+
+## --------------------------------------------------
+## 0) LOAD & PREP DATA
+## --------------------------------------------------
+library(dplyr)
+library(MASS)   # for glm.nb() and stepAIC()
+
+# 1. load clean motor policies data
+freq_large <- policies_train  # replace with your dataset name if needed
+
+# 2. categorical variables
+fac_vars <- c(
+  "gender","marital","employment","area","primary_usage",
+  "overnight_parking","security_device","ncd_level",
+  "transmission","fuel","body_type"
+)
+
+# 3. predictors to test
+preds <- c(
+  "age","years_licensed","gender","marital","employment",
+  "area","primary_usage","overnight_parking","security_device",
+  "ncd_level","transmission","fuel","body_type",
+  "vehicle_power","vehicle_age","engine_cc",
+  "vehicle_value","reported_mileage","num_drivers"
+)
+
+# 4. prepare modeling dataset
+freq_full <- freq_large %>%
+  mutate(across(all_of(fac_vars), factor)) %>%
+  dplyr::select(n_claims, exposure, all_of(preds)) %>%
+  na.omit()
+
+## --------------------------------------------------
+## 1) BUILD FULL NEGATIVE BINOMIAL MODEL
+## --------------------------------------------------
+
+# Model formula
+form_full <- as.formula(
+  paste(
+    "n_claims ~ offset(log(exposure)) +",
+    paste(preds, collapse = " + ")
+  )
+)
+
+# Fit full Negative Binomial model
+nb_full <- glm.nb(form_full, data = freq_full)
+
+# Summary of full model
+summary(nb_full)
+
+# Dispersion parameter for NegBin (should be near 1)
+pearson_resid <- residuals(nb_full, type = "pearson")
+dispersion <- sum(pearson_resid^2) / nb_full$df.residual
+cat("Initial Negative Binomial dispersion =", round(dispersion, 3), "\n")
+
+## --------------------------------------------------
+## 2) BACKWARD STEPWISE SELECTION USING AIC
+## --------------------------------------------------
+
+cat("\nRunning backward selection (AIC-based)...\n")
+nb_step <- stepAIC(nb_full, direction = "backward", trace = TRUE)
+
+## --------------------------------------------------
+## 3) RESULTS AND DIAGNOSTICS
+## --------------------------------------------------
+
+summary(nb_step)
+cat("\nFinal AIC:", AIC(nb_step), "\n")
+
+# Final dispersion check
+pearson_resid <- residuals(nb_step, type = "pearson")
+dispersion <- sum(pearson_resid^2) / nb_step$df.residual
+cat("Final model dispersion =", round(dispersion, 3), "\n")
+
+## --------------------------------------------------
+## 4) OPTIONAL DIAGNOSTIC PLOTS
+## --------------------------------------------------
+
+# Residuals vs Fitted
+plot(fitted(nb_step), residuals(nb_step, type = "pearson"),
+     xlab = "Fitted values", ylab = "Pearson residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red")
+
+# Cook's distance for influential observations
+plot(cooks.distance(nb_step), type = "h",
+     main = "Cook's Distance for Influential Observations")
+abline(h = 4/length(nb_step$fitted.values), col = "red")
