@@ -1,0 +1,101 @@
+## 2) INFLUENCE & LEVERAGE
+### ===============================
+
+# Assuming your model is:
+# nb_step2 <- <your NB model with splines>
+
+# 1. Hat values (leverage)
+lev <- hatvalues(nb_step2)
+p <- length(coef(nb_step2))        # number of parameters
+n <- nrow(freq_full)               # number of observations
+lev_cut <- 2 * p / n               # heuristic cutoff
+
+cat("Leverage cutoff:", lev_cut, "\n")
+cat("Max leverage:", max(lev), "\n\n")
+
+# Top 50 highest leverage observations
+idx_lev <- order(lev, decreasing = TRUE)[1:50]
+
+
+# 2. Cook's Distance (overall influence)
+cd <- cooks.distance(nb_step2)
+cd_cut <- 4 / n
+
+cat("Cook's distance cutoff:", cd_cut, "\n")
+cat("Max Cook's distance:", max(cd), "\n\n")
+
+# Top 50 most influential observations (Cook's distance)
+idx_cd <- order(cd, decreasing = TRUE)[1:50]
+
+
+# 3. DFBETAs (influence on individual coefficients)
+dfb <- dfbetas(nb_step2)
+max_dfb <- apply(abs(dfb), 1, max)    # one value per obs: strongest influence
+
+dfb_cut <- 2 / sqrt(n)
+
+cat("DFBETA cutoff:", dfb_cut, "\n")
+cat("Max DFBETA across all observations:", max(max_dfb), "\n\n")
+
+# Top 50 observations influencing coefficients the most
+idx_dfb <- order(max_dfb, decreasing = TRUE)[1:50]
+
+
+# ===========================
+# 4. COMBINE FLAGS (optional)
+# ===========================
+# Observations that appear in any of the 3 lists
+idx_flagged <- unique(c(idx_lev, idx_cd, idx_dfb))
+
+cat("Total flagged observations:", length(idx_flagged), "\n\n")
+
+
+# ===========================
+# 5. Inspect flagged cases
+# ===========================
+# Adjust columns to what you want to investigate
+inspect_cols <- c("n_claims", "exposure",
+                  "age", "vehicle_power", "reported_mileage",
+                  "area", "primary_usage", "ncd_level")
+
+freq_full[idx_flagged, inspect_cols]
+
+
+# ===========================
+# 1. Leverage Plot
+# ===========================
+plot(lev, 
+     ylab = "Leverage (hat values)", 
+     xlab = "Observation index", 
+     main = "Leverage values")
+abline(h = lev_cut, col = "red", lty = 2)   # cutoff line
+points(idx_lev, lev[idx_lev], col = "blue", pch = 19)
+
+# ===========================
+# 2. Cook's Distance Plot
+# ===========================
+plot(cd, 
+     ylab = "Cook's Distance", 
+     xlab = "Observation index", 
+     main = "Cook's Distance")
+abline(h = cd_cut, col = "red", lty = 2)
+points(idx_cd, cd[idx_cd], col = "blue", pch = 19)
+
+# ===========================
+# 3. DFBETAs Plot
+# ===========================
+plot(max_dfb, 
+     ylab = "Max |DFBETA| per observation", 
+     xlab = "Observation index", 
+     main = "DFBETAs influence")
+abline(h = dfb_cut, col = "red", lty = 2)
+points(idx_dfb, max_dfb[idx_dfb], col = "blue", pch = 19)
+
+# ===========================
+# 4. Influence Plot (combined)
+# ===========================
+plot(cd, lev, 
+     xlab = "Cook's Distance", 
+     ylab = "Leverage", 
+     main = "Influence Plot")
+points(idx_flagged, cd[idx_flagged], lev[idx_flagged], col = "blue", pch = 19)
