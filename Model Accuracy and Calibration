@@ -1,0 +1,196 @@
+#Diag Part 3
+### ===============================
+###   PART 3: MULTICOLLINEARITY
+### ===============================
+
+library(car)
+
+# 1. VIF for all predictors
+vif_vals <- vif(nb_step2)
+print(vif_vals)
+
+# Sort VIFs from large to small
+sort(vif_vals, decreasing = TRUE)
+
+# -------------------------------
+
+# 2. Correlation between numeric predictors
+numeric_vars <- c("age", "reported_mileage")
+
+cor_matrix <- cor(freq_full[, numeric_vars], use = "pairwise.complete.obs")
+print(cor_matrix)
+
+# -------------------------------
+
+# 3. Check stability of coefficients using an 80% random subsample
+set.seed(123)  
+idx <- sample(1:nrow(freq_full), size = 0.8 * nrow(freq_full))
+
+nb_sub <- glm.nb(
+  formula(nb_step2),
+  data = freq_full[idx, ]
+)
+
+# Compare coefficients (full vs subsample)
+coef_compare <- cbind(
+  full_model = coef(nb_step2),
+  subsample_model = coef(nb_sub)
+)
+
+round(coef_compare, 4)
+
+# Optional: absolute percentage change
+perc_change <- 100 * (coef(nb_sub) - coef(nb_step2)) / coef(nb_step2)
+round(perc_change, 2)
+
+
+### ===============================
+### CONDITION NUMBER (KAPPA)
+### ===============================
+
+# Model matrix (without the response)
+X <- model.matrix(nb_step2)
+
+# Condition number
+kappa_val <- kappa(X)
+
+kappa_val
+
+
+### ===============================
+### COHEN'S KAPPA FOR NB MODEL
+### ===============================
+
+library(caret)
+
+# 1. Actual outcome: 0 vs 1+
+actual_class <- ifelse(freq_full$n_claims > 0, "Claim", "NoClaim")
+
+# 2. Predicted probability of having ≥1 claim
+# From NB: P(Y >= 1) = 1 - P(Y = 0)
+mu_hat <- fitted(nb_step2)
+theta  <- nb_step2$theta  # NB dispersion parameter
+
+# Negative binomial pmf at zero:
+# P(Y=0) = (theta / (theta + mu))^theta
+p_zero <- (theta / (theta + mu_hat))^theta
+
+p_claim <- 1 - p_zero
+
+# 3. Convert probability to predicted class using 0.5 threshold
+pred_class <- ifelse(p_claim > 0.5, "Claim", "NoClaim")
+
+# 4. Compute Cohen’s Kappa
+kappa_result <- confusionMatrix(
+  factor(pred_class, levels=c("NoClaim","Claim")),
+  factor(actual_class, levels=c("NoClaim","Claim"))
+)$overall["Kappa"]
+
+kappa_result
+
+
+
+
+###############################################
+## 1. DECILE LIFT CHART
+###############################################
+
+# Sort test set by predicted frequency
+freq_test <- freq_test[order(freq_test$pred_claims, decreasing = TRUE), ]
+
+# Create 10 equal-sized buckets
+freq_test$lift_decile <- ntile(freq_test$pred_claims, 10)
+
+# Aggregate observed claims by decile
+lift_table <- freq_test %>%
+  group_by(lift_decile) %>%
+  summarise(
+    obs = mean(n_claims),
+    exp = mean(pred_claims)
+  ) %>%
+  arrange(lift_decile)
+
+lift_table
+
+# Plot lift
+plot(lift_table$lift_decile, lift_table$obs,
+     type = "b", pch = 19,
+     xlab = "Decile (1 = highest risk)",
+     ylab = "Observed mean claims",
+     main = "Lift Chart")
+lines(lift_table$lift_decile, lift_table$exp, col = "blue", lwd = 2)
+legend("topright", legend = c("Observed", "Expected"),
+       col = c("black", "blue"), lwd = c(1,2))
+
+
+###############################################
+## 2. GINI COEFFICIENT / LORENZ CURVE
+###############################################
+
+library(ineq)
+
+# Lorenz curve
+lorenz <- Lc(freq_test$pred_claims, freq_test$n_claims)
+
+# Plot Lorenz curve
+plot(lorenz,
+     main = "Lorenz Curve (Claims Weighted by Predictions)",
+     xlab = "Cumulative Share of Policies",
+     ylab = "Cumulative Share of Claims")
+
+# Gini
+gini <- ineq(freq_test$pred_claims, type = "Gini", weights = freq_test$n_claims)
+gini
+cat("Gini Coefficient =", round(gini, 4), "\n")
+
+gini_actual <- function(actual, pred) {
+  
+  # Order by predicted values
+  ord <- order(pred, decreasing = TRUE)
+  
+  actual <- actual[ord]
+  pred   <- pred[ord]
+  
+  # cumulative proportions
+  cum_actual <- cumsum(actual) / sum(actual)
+  cum_pop    <- seq_along(actual) / length(actual)
+  
+  # Gini = area between diag and Lorenz curve * 2
+  gini_val <- sum((cum_actual - cum_pop)) / length(actual)
+  return(2 * gini_val)
+}
+
+# Compute Gini for your model:
+gini_score <- gini_actual(freq_test$n_claims, freq_test$pred_claims)
+
+cat("Gini =", round(gini_score, 4), "\n")
+
+###############################################
+## 3. PREDICTIVE DEVIANCE ON TEST SET
+###############################################
+
+theta <- nb_combined$theta
+
+test_loglik <- sum(dnbinom(
+  freq_test$n_claims,
+  mu = freq_test$pred_claims,
+  size = theta,
+  log = TRUE
+))
+
+test_deviance <- -2 * test_loglik
+
+cat("Predictive Deviance (Test) =", round(test_deviance, 1), "\n")
+
+
+###############################################
+## 4. MODEL RELATIVITIES FOR PRICING
+###############################################
+
+coefs <- coef(nb_combined)
+
+# Convert log-coefficients to multiplicative relativities
+relativities <- exp(coefs)
+
+relativities
+
