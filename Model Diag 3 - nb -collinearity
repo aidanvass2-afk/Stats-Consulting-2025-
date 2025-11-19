@@ -1,0 +1,90 @@
+#Diag Part 3
+### ===============================
+###   PART 3: MULTICOLLINEARITY
+### ===============================
+
+library(car)
+
+# 1. VIF for all predictors
+vif_vals <- vif(nb_step2)
+print(vif_vals)
+
+# Sort VIFs from large to small
+sort(vif_vals, decreasing = TRUE)
+
+# -------------------------------
+
+# 2. Correlation between numeric predictors
+numeric_vars <- c("age", "reported_mileage")
+
+cor_matrix <- cor(freq_full[, numeric_vars], use = "pairwise.complete.obs")
+print(cor_matrix)
+
+# -------------------------------
+
+# 3. Check stability of coefficients using an 80% random subsample
+set.seed(123)  
+idx <- sample(1:nrow(freq_full), size = 0.8 * nrow(freq_full))
+
+nb_sub <- glm.nb(
+  formula(nb_step2),
+  data = freq_full[idx, ]
+)
+
+# Compare coefficients (full vs subsample)
+coef_compare <- cbind(
+  full_model = coef(nb_step2),
+  subsample_model = coef(nb_sub)
+)
+
+round(coef_compare, 4)
+
+# Optional: absolute percentage change
+perc_change <- 100 * (coef(nb_sub) - coef(nb_step2)) / coef(nb_step2)
+round(perc_change, 2)
+
+
+### ===============================
+### CONDITION NUMBER (KAPPA)
+### ===============================
+
+# Model matrix (without the response)
+X <- model.matrix(nb_step2)
+
+# Condition number
+kappa_val <- kappa(X)
+
+kappa_val
+
+
+### ===============================
+### COHEN'S KAPPA FOR NB MODEL
+### ===============================
+
+library(caret)
+
+# 1. Actual outcome: 0 vs 1+
+actual_class <- ifelse(freq_full$n_claims > 0, "Claim", "NoClaim")
+
+# 2. Predicted probability of having ≥1 claim
+# From NB: P(Y >= 1) = 1 - P(Y = 0)
+mu_hat <- fitted(nb_step2)
+theta  <- nb_step2$theta  # NB dispersion parameter
+
+# Negative binomial pmf at zero:
+# P(Y=0) = (theta / (theta + mu))^theta
+p_zero <- (theta / (theta + mu_hat))^theta
+
+p_claim <- 1 - p_zero
+
+# 3. Convert probability to predicted class using 0.5 threshold
+pred_class <- ifelse(p_claim > 0.5, "Claim", "NoClaim")
+
+# 4. Compute Cohen’s Kappa
+kappa_result <- confusionMatrix(
+  factor(pred_class, levels=c("NoClaim","Claim")),
+  factor(actual_class, levels=c("NoClaim","Claim"))
+)$overall["Kappa"]
+
+kappa_result
+
