@@ -1,93 +1,174 @@
-#Diag Part 3
-### ===============================
-###   PART 3: MULTICOLLINEARITY
-### ===============================
-
-library(car)
-
-# 1. VIF for all predictors
-vif_vals <- vif(nb_step2)
-print(vif_vals)
-
-# Sort VIFs from large to small
-sort(vif_vals, decreasing = TRUE)
-
-# -------------------------------
-
-# 2. Correlation between numeric predictors
-numeric_vars <- c("age", "reported_mileage")
-
-cor_matrix <- cor(freq_full[, numeric_vars], use = "pairwise.complete.obs")
-print(cor_matrix)
-
-# -------------------------------
-
-# 3. Check stability of coefficients using an 80% random subsample
-set.seed(123)  
-idx <- sample(1:nrow(freq_full), size = 0.8 * nrow(freq_full))
-
-nb_sub <- glm.nb(
-  formula(nb_step2),
-  data = freq_full[idx, ]
+nb_combined <- glm.nb(
+  
+  n_claims ~ 
+    
+    ns(age, 4) +
+    
+    ns(reported_mileage, 4) +
+    
+    gender + marital + employment + area +
+    
+    primary_usage + ncd_level + fuel +
+    
+    body_type + vehicle_power +
+    
+    age:gender +
+    
+    gender:marital +
+    
+    offset(log(exposure)),
+  
+  data = freq_full
+  
 )
 
-# Compare coefficients (full vs subsample)
-coef_compare <- cbind(
-  full_model = coef(nb_step2),
-  subsample_model = coef(nb_sub)
+AIC(nb_combined)
+
+###############################################
+## CLEAN TEST DATA EXACTLY LIKE TRAINING DATA
+###############################################
+
+# 1. Same factor variables
+fac_vars <- c(
+  "gender","marital","employment","area","primary_usage",
+  "overnight_parking","security_device","ncd_level",
+  "transmission","fuel","body_type"
 )
 
-round(coef_compare, 4)
+# 2. Same predictor list
+preds <- c(
+  "age","years_licensed","gender","marital","employment",
+  "area","primary_usage","overnight_parking","security_device",
+  "ncd_level","transmission","fuel","body_type",
+  "vehicle_power","vehicle_age","engine_cc",
+  "vehicle_value","reported_mileage","num_drivers"
+)
 
-# Optional: absolute percentage change
-perc_change <- 100 * (coef(nb_sub) - coef(nb_step2)) / coef(nb_step2)
-round(perc_change, 2)
+# 3. Convert factor variables to factors with SAME LEVELS as training
+for (v in fac_vars) {
+  if (v %in% names(policies_test)) {
+    policies_test[[v]] <- factor(policies_test[[v]],
+                                 levels = levels(freq_full[[v]]))  
+  }
+}
+
+# 4. Build cleaned test dataset
+freq_test <- policies_test %>%
+  dplyr::select(n_claims, exposure, all_of(preds)) %>%
+  na.omit()
+
+###############################################
+## freq_test is now CLEAN and matches training
+###############################################
+freq_test$pred_claims <- predict(nb_combined,
+                                 newdata = freq_test,
+                                 type = "response")
 
 
-### ===============================
-### CONDITION NUMBER (KAPPA)
-### ===============================
-
-# Model matrix (without the response)
-X <- model.matrix(nb_step2)
-
-# Condition number
-kappa_val <- kappa(X)
-
-kappa_val
 
 
-### ===============================
-### COHEN'S KAPPA FOR NB MODEL
-### ===============================
 
-library(caret)
 
-# 1. Actual outcome: 0 vs 1+
-actual_class <- ifelse(freq_full$n_claims > 0, "Claim", "NoClaim")
 
-# 2. Predicted probability of having ≥1 claim
-# From NB: P(Y >= 1) = 1 - P(Y = 0)
-mu_hat <- fitted(nb_step2)
-theta  <- nb_step2$theta  # NB dispersion parameter
 
-# Negative binomial pmf at zero:
-# P(Y=0) = (theta / (theta + mu))^theta
-p_zero <- (theta / (theta + mu_hat))^theta
 
-p_claim <- 1 - p_zero
 
-# 3. Convert probability to predicted class using 0.5 threshold
-pred_class <- ifelse(p_claim > 0.5, "Claim", "NoClaim")
 
-# 4. Compute Cohen’s Kappa
-kappa_result <- confusionMatrix(
-  factor(pred_class, levels=c("NoClaim","Claim")),
-  factor(actual_class, levels=c("NoClaim","Claim"))
-)$overall["Kappa"]
 
-kappa_result
+############################################################
+## 3. BINARY TARGET FOR AUC / CONFUSION MATRIX
+############################################################
 
+# Claim occurred (1 or 0)
+freq_test$claim_binary <- ifelse(freq_test$n_claims > 0, 1, 0)
+
+# Probability of >=1 claim from Poisson/NegBin
+freq_test$prob_claim <- 1 - exp(-freq_test$pred_claims)
+
+############################################################
+## 4. AUC
+############################################################
+
+library(pROC)
+auc_result <- roc(freq_test$claim_binary, freq_test$prob_claim)
+auc_result
+cat("AUC =", auc(auc_result), "\n")
+
+############################################################
+## 5. CONFUSION MATRIX (choose threshold 0.5 or optimise)
+############################################################
+
+# You can choose threshold = 0.5 OR optimise using Youden's J
+threshold <- 0.5
+
+freq_test$pred_class <- ifelse(freq_test$prob_claim > threshold, 1, 0)
+
+# Confusion matrix
+conf_mat <- table(
+  Actual = freq_test$claim_binary,
+  Predicted = freq_test$pred_class
+)
+conf_mat
+
+############################################################
+## 6. METRICS FROM CONFUSION MATRIX
+############################################################
+
+TP <- conf_mat["1", "1"]
+TN <- conf_mat["0", "0"]
+FP <- conf_mat["0", "1"]
+FN <- conf_mat["1", "0"]
+
+accuracy  <- (TP + TN) / sum(conf_mat)
+precision <- TP / (TP + FP)
+recall    <- TP / (TP + FN)
+f1        <- 2 * precision * recall / (precision + recall)
+
+cat("Accuracy:", round(accuracy, 4), "\n")
+cat("Precision:", round(precision, 4), "\n")
+cat("Recall:", round(recall, 4), "\n")
+cat("F1 Score:", round(f1, 4), "\n")
+
+
+
+
+###############################################
+## CALIBRATION ON TEST SET (freq_test)
+###############################################
+
+# 1. Overall calibration: observed vs expected claims
+calib_overall <- aggregate(
+  cbind(obs = n_claims, exp = pred_claims) ~ 1,
+  data = freq_test,
+  FUN = sum
+)
+
+calib_overall$ratio <- calib_overall$obs / calib_overall$exp
+calib_overall
+# ratio close to 1 = good overall calibration
+
+
+# 2. Calibration by deciles of predicted frequency
+freq_test$decile <- cut(
+  freq_test$pred_claims,
+  breaks = quantile(freq_test$pred_claims, probs = seq(0, 1, 0.1)),
+  include.lowest = TRUE
+)
+
+calib_deciles <- aggregate(
+  cbind(obs = n_claims, exp = pred_claims) ~ decile,
+  data = freq_test,
+  FUN = mean
+)
+
+calib_deciles
+
+# (Optional) quick plot
+plot(calib_deciles$exp, calib_deciles$obs,
+     xlab = "Expected mean claims per policy",
+     ylab = "Observed mean claims per policy",
+     main = "Test-set calibration by decile")
+abline(0, 1, lty = 2)
 
 
 
