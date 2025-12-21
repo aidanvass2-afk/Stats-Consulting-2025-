@@ -1,0 +1,111 @@
+#cannot be run until firstly datprep file has and then the severity model itself so you have the data frame
+## 0) Setup
+
+library(ggplot2)
+library(dplyr)
+library(scales)   # for label_comma()
+
+
+## ============================================================
+## 1) Choose data frame & global severity band
+## ============================================================
+
+df <- train   
+
+if (!"gross_amount_2025" %in% names(df)) {
+  stop("Column 'gross_amount_2025' not found in df.")
+}
+
+# Global severity 10th–90th percentiles
+sev_q10 <- quantile(df$gross_amount_2025, 0.10, na.rm = TRUE)
+sev_q90 <- quantile(df$gross_amount_2025, 0.90, na.rm = TRUE)
+
+cat("Severity 10th percentile:", sev_q10, "\n")
+cat("Severity 90th percentile:", sev_q90, "\n")
+
+
+## ============================================================
+## 2) Scatterplots: each NUMERIC var 10–90% vs severity 10–90%
+## ============================================================
+
+num_vars <- names(df)[sapply(df, is.numeric)]
+num_vars <- setdiff(num_vars, "gross_amount_2025")  # predictors only
+
+cat("Numeric variables to plot (with per-variable 10–90% zoom):\n")
+print(num_vars)
+
+set.seed(67)
+
+for (v in num_vars) {
+  message("Plotting numeric variable (10–90% zoom on x & y): ", v)
+  
+  # 10th–90th percentile of this predictor
+  x_q <- quantile(df[[v]], probs = c(0.10, 0.90), na.rm = TRUE)
+  x_q10 <- x_q[1]
+  x_q90 <- x_q[2]
+  
+  # Filter to central 80% of *both* x and severity
+  df_v <- df %>%
+    filter(
+      !is.na(.data[[v]]),
+      .data[[v]] >= x_q10, .data[[v]] <= x_q90,
+      gross_amount_2025 >= sev_q10, gross_amount_2025 <= sev_q90
+    )
+  
+  # Optional sampling to avoid lag
+  df_v_plot <- if (nrow(df_v) > 20000) sample_n(df_v, 20000) else df_v
+  
+  p <- ggplot(df_v_plot, aes_string(x = v, y = "gross_amount_2025")) +
+    geom_point(alpha = 0.3) +
+    geom_smooth(method = "loess", se = FALSE, span = 0.7, colour = "blue") +
+    scale_x_continuous(
+      limits = c(x_q10, x_q90),
+      labels = label_comma()
+    ) +
+    scale_y_continuous(
+      limits = c(sev_q10, sev_q90),
+      labels = label_comma()
+    ) +
+    labs(
+      title = paste0(
+        "Severity vs ", v,
+        " (x: 10–90% of ", v,
+        ", y: 10–90% of severity)"
+      ),
+      x = v,
+      y = "Severity (gross_amount_2025)"
+    ) +
+    theme_minimal(base_size = 13)
+  
+  print(p)
+}
+
+
+## ============================================================
+## 3) Boxplots: severity vs categorical vars
+## ============================================================
+
+cat_vars <- names(df)[sapply(df, is.factor)]
+
+cat("Categorical variables to plot:\n")
+print(cat_vars)
+
+for (v in cat_vars) {
+  message("Plotting categorical variable: ", v)
+  
+  p <- ggplot(df, aes_string(x = v, y = "gross_amount_2025")) +
+    geom_boxplot(outlier.alpha = 0.3) +
+    scale_y_continuous(labels = label_comma()) +
+    labs(
+      title = paste("Severity (gross_amount_2025) by", v),
+      x = v,
+      y = "Severity (gross_amount_2025)"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid.major.x = element_blank()
+    )
+  
+  print(p)
+}
