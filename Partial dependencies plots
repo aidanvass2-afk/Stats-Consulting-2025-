@@ -1,0 +1,94 @@
+library(pdp)
+library(ggplot2)
+library(Matrix)
+
+library(pdp)
+library(ggplot2)
+library(Matrix)
+library(scales)
+library(tools)
+
+## 0) Numeric predictors (exclude target and log target)
+numeric_vars <- names(train_ml)[sapply(train_ml, is.numeric)]
+numeric_vars <- setdiff(numeric_vars, c("gross_amount_2025", "log_gross"))
+numeric_vars
+
+## 1) Ensure training data is a plain data.frame
+train_df <- as.data.frame(train_ml)
+
+## 2) Blueprint: columns used in XGBoost training
+blueprint_cols <- colnames(X_train)
+
+## 3) Build design matrix with EXACT same columns as training
+make_xgb_matrix <- function(newdata) {
+  newdata <- as.data.frame(newdata)
+  
+  tmp <- sparse.model.matrix(~ . - 1, data = newdata)
+  
+  missing_cols <- setdiff(blueprint_cols, colnames(tmp))
+  extra_cols   <- setdiff(colnames(tmp), blueprint_cols)
+  
+  # add any missing columns as zeros
+  if (length(missing_cols) > 0) {
+    for (mc in missing_cols) {
+      tmp <- cbind(tmp, 0)
+      colnames(tmp)[ncol(tmp)] <- mc
+    }
+  }
+  
+  # drop extra cols and reorder
+  tmp <- tmp[, blueprint_cols, drop = FALSE]
+  tmp
+}
+
+## 4) Prediction wrapper: log model -> severity (€) with smearing
+predict_xgb_pdp <- function(object, newdata) {
+  X <- make_xgb_matrix(newdata)
+  log_pred <- predict(object, X)           # model output on log scale
+  sev_pred <- exp(log_pred) * smear_factor # back to severity €
+  as.numeric(sev_pred)
+}
+
+## 5) Pretty names for titles / axes
+pretty_var_name <- function(v) {
+  if (v == "ncd_level") return("NCD Level")
+  # default: replace "_" with space and Title Case
+  x <- gsub("_", " ", v)
+  toTitleCase(x)
+}
+
+## 6) Build PDPs for all numeric variables
+pdp_list <- list()
+
+for (v in numeric_vars) {
+  cat("Making PDP for:", v, "\n")
+  
+  pd <- partial(
+    object          = xgb_model,
+    pred.var        = v,
+    pred.fun        = predict_xgb_pdp,
+    train           = train_df,
+    grid.resolution = 50,
+    parallel        = FALSE
+  )
+  
+  x_lab  <- pretty_var_name(v)
+  title_ <- paste("Partial Dependence Plot of Severity vs", x_lab)
+  
+  g <- autoplot(pd) +
+    labs(
+      title = title_,
+      x     = x_lab,
+      y     = "Predicted Severity (€)"
+    ) +
+    scale_x_continuous(
+      labels = label_number(accuracy = 1, big.mark = ",")
+    )
+  
+  pdp_list[[v]] <- g
+}
+
+## 7) Loop to print ALL PDPs at the end
+for (nm in names(pdp_list)) {
+  print(pdp_list[[nm]])
+}
