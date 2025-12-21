@@ -1,0 +1,618 @@
+#0) Basic structure and inspection
+# Setting the seed right at the start, though we will reinforce this before specific random blocks later.
+set.seed(67)
+
+names(claims_enriched)
+str(claims_enriched)
+
+summary(claims_enriched)
+# Quick check to see if we have any missing values we need to worry about.
+colSums(is.na(claims_enriched))
+
+#1) Remove unwanted columns
+# We're dropping ID columns, old calc fields, and things we won't know at the time of quoting.
+drops <- c("policy_id", "cal_year", "occurrence_date", "net_amount",
+           "vehicle_id","age","engine_cc","infl_factor_2025","gross_amount","primary_usage","occupation")
+
+claims_enriched <- claims_enriched[, !(names(claims_enriched) %in% drops)]
+
+
+#2) Convert character variables to factor
+# Loop through and force any character strings into factor levels for the GLM/Models.
+factor_vars <- sapply(claims_enriched, is.character)
+claims_enriched[factor_vars] <- lapply(claims_enriched[factor_vars], factor)
+
+str(claims_enriched)
+
+# Grouping EV and Hybrid together since they likely behave similarly and we might be thin on data for EVs alone.
+levels(claims_enriched$fuel)[levels(claims_enriched$fuel) %in% c("EV", "Hybrid")] <- "EV_Hybrid"
+
+# Just in case the merge left behind any empty levels, let's clean them up.
+claims_enriched$fuel <- droplevels(claims_enriched$fuel)
+
+# Double checking the merge worked.
+table(claims_enriched$fuel)
+
+#3) Identify numeric / categorical vars, just general check up
+num_vars <- names(claims_enriched)[sapply(claims_enriched, is.numeric)]
+cat_vars <- names(claims_enriched)[sapply(claims_enriched, is.factor)]
+num_vars
+cat_vars
+
+
+#4) PCA correlation diagnostic
+# We aren't actually using PCA for reduction here because we lose explainability, but checking correlations is good practice.
+# We exclude the target variable from this check.
+num_pred_vars <- setdiff(num_vars, "gross_amount_2025")
+
+if (length(num_pred_vars) >= 2) {
+  cor_mat <- cor(claims_enriched[, num_pred_vars], use = "pairwise.complete.obs")
+  
+  max_corr <- max(abs(cor_mat[upper.tri(cor_mat)]))
+  cat("Max absolute pairwise correlation:", max_corr, "\n")
+  
+  library(corrplot)
+  corrplot(cor_mat, method = "color")
+} else {
+  message("Too few numeric predictors to justify PCA.")
+}
+
+
+#5) Train / test split (70/30)
+# Setting the seed explicitly here to ensure the split is identical every time we run this.
+set.seed(67)
+
+n  <- nrow(claims_enriched)
+ix <- sample(seq_len(n), size = 0.7 * n)
+
+train <- claims_enriched[ix, ]
+test  <- claims_enriched[-ix, ]
+
+
+# 6) GLM for severity which is predicting the inflated claims column gross_amount_2025
+library(MASS)
+
+# Starting with a full Gamma GLM (log link) as a baseline.
+full_model <- glm(
+  gross_amount_2025 ~ .,
+  data   = train,
+  family = Gamma(link = "log")
+)
+
+summary(full_model)
+
+# Let's run a backward stepwise selection to thin out the variables. Using AIC as the criteria.
+back_model <- stepAIC(full_model, direction = "backward", trace = TRUE)
+summary(back_model)
+
+# Checking the dispersion to see if the Gamma assumption holds up reasonably well.
+dispersion <- summary(back_model)$deviance / summary(back_model)$df.residual
+cat("Dispersion estimate:", dispersion, "\n")
+
+
+#7) Predict on train and test
+# Generating response-level predictions (Euro amount) for the GLM.
+train$pred_gross2025 <- predict(back_model, newdata = train, type = "response")
+test$pred_gross2025  <- predict(back_model, newdata = test, type = "response")
+
+
+# 8) GLM performance metrics
+# Quick helper functions for standard metrics.
+rmse <- function(y, yhat) sqrt(mean((y - yhat)^2, na.rm = TRUE))
+mae  <- function(y, yhat) mean(abs(y - yhat), na.rm = TRUE)
+
+cat("GLM Train RMSE:", rmse(train$gross_amount_2025, train$pred_gross2025), "\n")
+cat("GLM Test  RMSE:", rmse(test$gross_amount_2025,  test$pred_gross2025), "\n")
+
+cat("GLM Train MAE :", mae(train$gross_amount_2025, train$pred_gross2025), "\n")
+cat("GLM Test  MAE :", mae(test$gross_amount_2025,  test$pred_gross2025), "\n")
+
+
+# 9) Prepare data for XGBoost (drop GLM predictions)
+# We need clean dataframes without the GLM predictions columns for the ML step.
+train_ml <- subset(train, select = -pred_gross2025)
+test_ml  <- subset(test,  select = -pred_gross2025)
+
+# Sanity check: Log-links fail on zero or negative values. Ensuring data is strictly positive.
+cat("Train: nonpositive gross_amount_2025 rows:\n")
+print(sum(train_ml$gross_amount_2025 <= 0, na.rm = TRUE))
+
+cat("Test: nonpositive gross_amount_2025 rows:\n")
+print(sum(test_ml$gross_amount_2025 <= 0, na.rm = TRUE))
+
+
+# 10) XGBoost on log(gross_amount_2025)
+library(xgboost)
+library(Matrix)
+library(dplyr)
+library(evir)   
+
+# We train on the log of the severity because it stabilizes the variance for the gradient booster.
+train_ml$log_gross <- log(train_ml$gross_amount_2025)
+test_ml$log_gross  <- log(test_ml$gross_amount_2025)
+
+cat("Summary of log_gross (train):\n")
+print(summary(train_ml$log_gross))
+
+# Creating sparse matrices. XGBoost requires numeric inputs, so factors must be one-hot encoded.
+X_train <- sparse.model.matrix(
+  log_gross ~ . - gross_amount_2025 - 1,
+  data = train_ml
+)
+
+X_test <- sparse.model.matrix(
+  log_gross ~ . - gross_amount_2025 - 1,
+  data = test_ml
+)
+
+y_train <- train_ml$log_gross
+
+# Convert to internal DMatrix format for speed.
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test)
+
+# Hyperparameters chosen after grid search (detailed in the report).
+# Using squared error on the log-values.
+params <- list(
+  objective            = "reg:squarederror",
+  eval_metric          = "rmse",
+  eta                  = 0.05,
+  max_depth            = 6,
+  subsample            = 0.8,
+  colsample_bytree     = 0.8,
+  validate_parameters  = TRUE
+)
+
+# Running Cross-Validation to find the optimal number of trees (nrounds).
+# Setting seed again here because CV folds are stochastic.
+set.seed(67)
+
+cv_res <- xgb.cv(
+  params                = params,
+  data                  = dtrain,
+  nrounds               = 3000,
+  nfold                 = 5,
+  early_stopping_rounds = 50,
+  verbose               = 1
+)
+
+best_nrounds <- cv_res$best_iteration
+cat("Best number of boosting rounds:", best_nrounds, "\n")
+
+# Train the final model using the best iteration found.
+# Setting seed one last time for the training process (subsampling).
+set.seed(67)
+
+xgb_model <- xgb.train(
+  params        = params,
+  data          = dtrain,
+  nrounds       = best_nrounds,
+  watchlist     = list(train = dtrain),
+  print_every_n = 100
+)
+
+
+## 11) XGB Predictions
+# First we get predictions on the log scale (what the model learned).
+log_pred_train <- predict(xgb_model, dtrain)
+log_pred_test  <- predict(xgb_model, dtest)
+
+# Exponentiate to get back to the Euro scale (the "Body" prediction).
+pred_body_train <- exp(log_pred_train)
+pred_body_test  <- exp(log_pred_test)
+
+
+# Now for the EVT part. XGBoost is great for the "body" of the data, but usually under-predicts
+# the massive outliers. We'll fit a Generalized Pareto Distribution (GPD) to the top 1% excesses.
+sev_train <- train_ml$gross_amount_2025
+
+u <- quantile(sev_train, 0.995)
+cat("EVT threshold u (99.5th pct of train gross_amount_2025):", u, "\n")
+
+# Fitting the GPD. This uses ML estimation, which is generally stable.
+gpd_fit <- gpd(sev_train, u)
+print(gpd_fit$par.ests)
+
+xi   <- gpd_fit$par.ests["xi"]
+beta <- gpd_fit$par.ests["beta"]
+
+
+# 12) XGB performance metrics 
+# Checking how the model performed purely on the log scale before we do the fancy EVT blending.
+rmse <- function(y, yhat) sqrt(mean((y - yhat)^2, na.rm = TRUE))
+mae  <- function(y, yhat) mean(abs(y - yhat), na.rm = TRUE)
+
+cat("XGB Train RMSE (log_gross):", rmse(y_train, log_pred_train), "\n")
+cat("XGB Test  RMSE (log_gross):",
+    rmse(log(test_ml$gross_amount_2025), log_pred_test), "\n")
+
+
+# 13) Variable Importance (gain based)
+# Which variables actually drove the splits in the trees?
+importance <- xgb.importance(
+  model         = xgb_model,
+  feature_names = colnames(X_train)
+)
+print(head(importance, 20))
+
+xgb.plot.importance(importance_matrix = importance)
+
+
+# 14) SHAP via xgboost::predict(..., predcontrib = TRUE) (TreeSHAP)
+# Calculating SHAP values to explain individual predictions. 
+# The last column is the Bias (intercept), the rest are feature contributions.
+
+# Train set SHAP
+S_train_raw <- predict(
+  xgb_model,
+  dtrain,
+  predcontrib = TRUE
+)
+
+p_train_shap <- ncol(S_train_raw)
+bias_train   <- S_train_raw[, p_train_shap]               
+shap_train   <- S_train_raw[, -p_train_shap, drop = FALSE]
+
+cat("Range of bias_train (should be tiny variance): \n")
+print(range(bias_train))
+
+# Test set SHAP
+S_test_raw <- predict(
+  xgb_model,
+  dtest,
+  predcontrib = TRUE
+)
+p_test_shap <- ncol(S_test_raw)
+bias_test   <- S_test_raw[, p_test_shap]
+shap_test   <- S_test_raw[, -p_test_shap, drop = FALSE]
+
+cat("Range of bias_test (should be tiny variance):\n")
+print(range(bias_test))
+
+
+# 15) Local accuracy diagnostics
+# Just verifying that the sum of SHAP values + Bias actually equals the model prediction.
+# It's a good sanity check for the package calculation.
+
+# TEST Check
+log_pred_model_test    <- predict(xgb_model, dtest)          
+log_pred_from_shaptest <- bias_test + rowSums(shap_test)     
+
+cat("Correlation (log-scale) between SHAP-based preds and model preds (TEST):\n")
+print(cor(log_pred_from_shaptest, log_pred_model_test))
+
+cat("Summary of difference (model - SHAP reconstruction) on log scale (TEST):\n")
+print(summary(log_pred_model_test - log_pred_from_shaptest))
+
+# TRAIN Check
+log_pred_model_train    <- predict(xgb_model, dtrain)
+log_pred_from_shaptrain <- bias_train + rowSums(shap_train)
+
+cat("Correlation (log-scale) between SHAP-based preds and model preds (TRAIN):\n")
+print(cor(log_pred_from_shaptrain, log_pred_model_train))
+
+cat("Summary of difference (model - SHAP reconstruction) on log scale (TRAIN):\n")
+print(summary(log_pred_model_train - log_pred_from_shaptrain))
+
+
+# 16) SHAP analysis on severity scale (TEST set)
+# Converting log-scale SHAP contributions into multiplicative factors on the Euro scale.
+# This makes it easier to explain to stakeholders ("Being a Student multiplies risk by 1.1x").
+
+shap_log_test  <- shap_test                       
+baseline_log   <- bias_test[1]                    
+baseline_mult  <- exp(baseline_log)               
+
+# First, let's look at the global median effect across all policies to see what's driving the model generally.
+median_log_effect_global <- apply(shap_log_test, 2, median)
+mult_summary_global      <- exp(median_log_effect_global)
+
+mult_summary_global_sorted <- sort(mult_summary_global)
+
+cat("GLOBAL median multiplicative SHAP factors by feature (over ALL test policies):\n")
+print(round(mult_summary_global_sorted, 3))
+
+
+# Now looking at level-wise effects. For factor variables (dummies), we only care about the impact
+# when that specific factor is active (1). Zeros wash out the median.
+feature_names <- colnames(X_test)  
+levelwise_mult <- numeric(length(feature_names))
+names(levelwise_mult) <- feature_names
+
+for (j in seq_along(feature_names)) {
+  
+  xj <- X_test[, j]
+  
+  # Only look at rows where the feature is present/non-zero
+  idx_active <- which(xj != 0)
+  
+  if (length(idx_active) == 0) {
+    levelwise_mult[j] <- NA
+    next
+  }
+  
+  # Median SHAP value on the log scale for these specific rows
+  levelwise_mult[j] <- exp(median(shap_log_test[idx_active, j]))
+}
+
+levelwise_mult_sorted <- sort(levelwise_mult, na.last = TRUE)
+
+cat("\nLEVEL-WISE multiplicative SHAP factors (factor dummy active = 1):\n") 
+# Note: Keep in mind this logic applies best to binary/dummy vars. Numeric vars need different interpretation.
+print(round(levelwise_mult_sorted, 3))
+
+# Checking how many samples we actually had for each feature to judge credibility.
+active_counts <- colSums(X_test != 0)
+cat("\nNumber of active rows per feature:\n")
+print(active_counts)
+
+
+# --- Residual Analysis ---
+
+# Calculating residuals on the log scale to see how "off" we are before transformation.
+log_y_train <- train_ml$log_gross
+log_y_test  <- log(test_ml$gross_amount_2025)
+
+res_log_train <- log_y_train - log_pred_train
+res_log_test  <- log_y_test  - log_pred_test
+
+cat("\nLOG(gross)-SCALE RESIDUALS (train):\n")
+print(summary(res_log_train))
+cat("SD(train log_gross residuals):", sd(res_log_train), "\n")
+
+cat("\nLOG(gross)-SCALE RESIDUALS (test):\n")
+print(summary(res_log_test))
+cat("SD(test log_gross residuals):", sd(res_log_test), "\n")
+
+
+# --- Smearing Correction ---
+# Since we modeled on Log(Y), simply doing exp(prediction) underestimates the mean.
+# We use Duan's Smearing Estimator (non-parametric) to fix this bias.
+
+smear_factor <- mean(exp(res_log_train))
+
+# Calculating the theoretical factor if residuals were perfectly normal (for comparison).
+sigma2_log <- var(res_log_train)
+smear_factor_param <- exp(0.5 * sigma2_log)
+
+cat("\nDuan smearing factor (train):", smear_factor, "\n")
+cat("Parametric lognormal smear factor (exp(0.5*Var)):", smear_factor_param, "\n")
+
+# Apply the correction to our body predictions.
+pred_body_train_smear <- exp(log_pred_train) * smear_factor
+pred_body_test_smear  <- exp(log_pred_test)  * smear_factor
+
+
+# --- Hybrid Model Construction ---
+# We are blending the XGBoost body prediction with the GPD tail prediction.
+# We define a "blend zone" (e.g., top 1%) so there isn't a harsh jump.
+
+body_train <- pred_body_train_smear
+body_test  <- pred_body_test_smear
+
+# Calculate where each prediction sits in the empirical distribution (ECDF) of the training set.
+F_body <- ecdf(body_train)
+
+p_train <- F_body(body_train)
+p_test  <- F_body(body_test)   
+
+cut_p <- 0.995    # The point where we start shifting trust from XGB to GPD.
+
+# Calculate the weight (alpha) given to the GPD. 0 means all XGB, 1 means all GPD.
+alpha_train <- pmax(p_train - cut_p, 0) / (1 - cut_p)   
+alpha_test  <- pmax(p_test  - cut_p, 0) / (1 - cut_p)
+
+# We use gamma > 1 to make the transition smoother, keeping XGB dominant a bit longer.
+gamma <- 8  
+alpha_train <- alpha_train^gamma
+alpha_test  <- alpha_test^gamma
+
+# Adding a tiny epsilon to prevent numerical errors at the exact boundary.
+eps <- 1e-2
+p_evt_train <- pmin(pmax(alpha_train, eps), 1 - eps)
+p_evt_test  <- pmin(pmax(alpha_test,  eps), 1 - eps)
+
+# Calculate the specific GPD severity value for these tail probabilities.
+sev_evt_train <- u + qgpd(p_evt_train, xi = xi, beta = beta)
+sev_evt_test  <- u + qgpd(p_evt_test,  xi = xi, beta = beta)
+
+# Weighted average of Body and Tail.
+pred_train_hybrid <- (1 - alpha_train) * body_train + alpha_train * sev_evt_train
+pred_test_hybrid  <- (1 - alpha_test)  * body_test  + alpha_test  * sev_evt_test
+
+# --- Top-End Calibration ---
+# Even with GPD, the very top 1% might be slightly off level. We calculate a simple ratio (k_tail)
+# to align the average predicted top 1% with the average actual top 1%.
+library(data.table)
+train_diag_hybrid <- data.table(
+  pred   = pred_train_hybrid,
+  actual = train_ml$gross_amount_2025
+)
+
+q1_train <- quantile(train_diag_hybrid$pred, 0.99)
+tail_1_train <- train_diag_hybrid[pred >= q1_train]
+
+k_tail <- mean(tail_1_train$actual) / mean(tail_1_train$pred)
+cat("Top 1% calibration factor k_tail:", k_tail, "\n")
+
+# Apply this correction to the very top predictions.
+# Train
+train_diag_hybrid[, pred_cal :=
+                    ifelse(pred >= q1_train, pred * k_tail, pred)]
+
+# Test
+test_diag_hybrid <- data.table(
+  pred   = pred_test_hybrid,
+  actual = test_ml$gross_amount_2025
+)
+
+q1_test <- quantile(test_diag_hybrid$pred, 0.99)
+test_diag_hybrid[, pred_cal :=
+                   ifelse(pred >= q1_test, pred * k_tail, pred)]
+
+
+# Checking how many policies actually got affected by the GPD blend.
+cat("\nHybrid model (smooth): proportion of TRAIN in blended tail:",
+    mean(alpha_train > 0), "\n")
+cat("Hybrid model (smooth): proportion of TEST  in blended tail:",
+    mean(alpha_test  > 0), "\n")
+
+
+# Calibration by Decile 
+# Standard actuarial check: Split data into 10 buckets by predicted severity,
+# and check if the average prediction matches the average actual in each bucket.
+
+library(data.table)
+
+test_diag_hybrid <- data.table(
+  pred   = pred_test_hybrid,
+  actual = test_ml$gross_amount_2025
+)
+
+test_diag_hybrid[, decile := cut(
+  pred,
+  breaks = quantile(pred, probs = seq(0, 1, 0.1)),
+  include.lowest = TRUE
+)]
+
+calib_table_hybrid <- test_diag_hybrid[, .(
+  n              = .N,
+  mean_pred      = mean(pred),
+  mean_actual    = mean(actual),
+  ratio_act_pred = mean(actual) / mean(pred)
+), by = decile][order(decile)]
+
+cat("\nCALIBRATION BY PREDICTED-SEVERITY DECILE (TEST) – XGB+GPD HYBRID:\n")
+print(calib_table_hybrid)
+
+
+# --- Tail Analysis ---
+# Zooming in specifically on the top 1% and 5% to see if our extreme value theory worked.
+q1_h <- quantile(test_diag_hybrid$pred, 0.99)
+q5_h <- quantile(test_diag_hybrid$pred, 0.95)
+
+tail_1_h <- test_diag_hybrid[pred >= q1_h]
+tail_5_h <- test_diag_hybrid[pred >= q5_h]
+
+tail_summary <- function(dt, label) {
+  cat("\nTAIL DIAGNOSTIC -", label, "\n")
+  cat("N:", nrow(dt), "\n")
+  cat("Mean predicted:", mean(dt$pred), "\n")
+  cat("Mean actual   :", mean(dt$actual), "\n")
+  cat("Ratio actual/pred:", mean(dt$actual) / mean(dt$pred), "\n")
+}
+
+tail_summary(tail_1_h, "Top 1% predictions (test) – XGB+GPD HYBRID")
+tail_summary(tail_5_h, "Top 5% predictions (test) – XGB+GPD HYBRID")
+
+
+
+# Rebuild calibrated hybrid predictions (Final Objects)
+
+
+# Applying the tail calibration factor k_tail cleanly to vectors for final scoring.
+hybrid_train_cal <- ifelse(pred_train_hybrid >= q1_train,
+                           pred_train_hybrid * k_tail,
+                           pred_train_hybrid)
+
+hybrid_test_cal  <- ifelse(pred_test_hybrid  >= q1_test,
+                           pred_test_hybrid  * k_tail,
+                           pred_test_hybrid)
+
+
+
+# Helper metric functions
+
+
+# Defining a set of metric functions
+# Includes RMSE, MAE, Gini, and R-squared.
+
+rmse_local <- function(y, yhat) {
+  idx <- is.finite(y) & is.finite(yhat)
+  y <- y[idx]; yhat <- yhat[idx]
+  sqrt(mean((y - yhat)^2))
+}
+
+mae_local <- function(y, yhat) {
+  idx <- is.finite(y) & is.finite(yhat)
+  y <- y[idx]; yhat <- yhat[idx]
+  mean(abs(y - yhat))
+}
+
+gini_local <- function(actual, pred) {
+  idx <- is.finite(actual) & is.finite(pred)
+  actual <- actual[idx]
+  pred   <- pred[idx]
+  if (length(actual) == 0) return(NA_real_)
+  
+  ord <- order(pred)
+  actual <- actual[ord]
+  n <- length(actual)
+  
+  gini_num <- sum((2 * (1:n) - n - 1) * actual)
+  gini_den <- n * sum(actual)
+  gini_num / gini_den
+}
+
+normalized_gini_local <- function(actual, pred) {
+  g_pred <- gini_local(actual, pred)
+  g_perf <- gini_local(actual, actual)
+  g_pred / g_perf
+}
+
+r2_local <- function(y, yhat) {
+  idx <- is.finite(y) & is.finite(yhat)
+  y <- y[idx]; yhat <- yhat[idx]
+  ss_res <- sum((y - yhat)^2)
+  ss_tot <- sum((y - mean(y))^2)
+  1 - ss_res / ss_tot
+}
+
+corr_local <- function(y, yhat) {
+  idx <- is.finite(y) & is.finite(yhat)
+  if (sum(idx) == 0) return(NA_real_)
+  cor(y[idx], yhat[idx])
+}
+
+
+# Hybrid XGB + GPD metrics (calibrated)
+
+# Final printout of how our hybrid model is performing on both Train and Test.
+
+actual_train_h <- train_ml$gross_amount_2025
+actual_test_h  <- test_ml$gross_amount_2025
+
+pred_train_h   <- hybrid_train_cal
+pred_test_h    <- hybrid_test_cal
+
+hybrid_rmse_train <- rmse_local(actual_train_h, pred_train_h)
+hybrid_rmse_test  <- rmse_local(actual_test_h,  pred_test_h)
+
+hybrid_mae_train  <- mae_local(actual_train_h, pred_train_h)
+hybrid_mae_test   <- mae_local(actual_test_h,  pred_test_h)
+
+hybrid_gini_train  <- gini_local(actual_train_h, pred_train_h)
+hybrid_gini_test   <- gini_local(actual_test_h,  pred_test_h)
+
+hybrid_ngini_train <- normalized_gini_local(actual_train_h, pred_train_h)
+hybrid_ngini_test  <- normalized_gini_local(actual_test_h,  pred_test_h)
+
+hybrid_r2_train   <- r2_local(actual_train_h, pred_train_h)
+hybrid_r2_test    <- r2_local(actual_test_h,  pred_test_h)
+
+hybrid_corr_train <- corr_local(actual_train_h, pred_train_h)
+hybrid_corr_test  <- corr_local(actual_test_h,  pred_test_h)
+
+cat("\n================ Hybrid XGB + GPD Severity Model ================\n")
+cat("Train RMSE            :", hybrid_rmse_train,   "\n")
+cat("Test  RMSE            :", hybrid_rmse_test,    "\n")
+cat("Train MAE             :", hybrid_mae_train,    "\n")
+cat("Test  MAE             :", hybrid_mae_test,     "\n")
+cat("Train Gini            :", hybrid_gini_train,   "\n")
+cat("Test  Gini            :", hybrid_gini_test,    "\n")
+cat("Train Normalised Gini :", hybrid_ngini_train,  "\n")
+cat("Test  Normalised Gini :", hybrid_ngini_test,   "\n")
+cat("Train R^2             :", hybrid_r2_train,     "\n")
+cat("Test  R^2             :", hybrid_r2_test,      "\n")
+cat("Train Corr(actual,pred):", hybrid_corr_train,  "\n")
+cat("Test  Corr(actual,pred):", hybrid_corr_test,   "\n")
